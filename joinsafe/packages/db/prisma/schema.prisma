@@ -1,13 +1,31 @@
-// JoinSafe — Prisma Schema
+// JoinSafe — Prisma Schema v2
 //
-// Design principles:
-//  - Companies can be public (has CIK/ticker) or private (WARN-only matching)
-//  - Each Company has one current RiskScore and a full RiskScoreHistory for trending
-//  - WARN notices are deduplicated by (sourceState, sourceRowId) — scrapers are idempotent
-//  - SEC filings store extracted financial metrics as typed columns, not raw JSON,
-//    so the risk engine can run SQL-side aggregations without deserializing
-//  - BigInt for monetary values (stored as cents) to avoid float precision loss
-//  - Users are optional — the scoring pipeline runs independently of auth
+// ── Design principles ────────────────────────────────────────────────────────
+//
+// 1. PROVENANCE FIRST: Every data point links to a SourceDocument so we can
+//    answer "where did this come from?" for any field at any time. This is
+//    critical for a trust-first product.
+//
+// 2. LAYOFF AS FIRST-CLASS ENTITY: LayoffEvent replaces the old WarnNotice.
+//    It supports multiple source types (WARN, SEC, press release, manual) and
+//    a structured reason classification — making it the canonical record of
+//    a workforce reduction event regardless of origin.
+//
+// 3. FLEXIBLE FINANCIALS: FinancialReport + FinancialMetric (key-value) vs. a
+//    single wide table. This lets us add new GAAP/XBRL concepts without
+//    migrations, and store both numeric and text-type values cleanly.
+//
+// 4. EXPLICIT ENTITLEMENTS: UserPlan is a separate table with explicit boolean
+//    and integer fields for each capability. This allows custom plans and
+//    grandfathered pricing without code changes.
+//
+// 5. USAGE COUNTERS: A dedicated per-(user, year, month) counter table supports
+//    rate limiting without advisory locks or Redis. Increment in a transaction
+//    alongside the action being counted.
+//
+// 6. BANDS vs TIERS: The DB uses RiskBand (LOW / MEDIUM / HIGH) — simple,
+//    filter-friendly. The UI maps score → 5-tier display (STABLE → CRITICAL)
+//    from the numeric score. Both convey risk; the band is for DB queries.
 
 generator client {
   provider = "prisma-client-js"
@@ -18,140 +36,212 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ─── Employer / Company ────────────────────────────────────────────────────────
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// COMPANY INTELLIGENCE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 model Company {
-  id             String   @id @default(cuid())
+  id             String      @id @default(cuid())
   name           String
-  slug           String   @unique
-  normalizedName String   // Lowercase, punctuation-stripped — for fuzzy matching
+  normalizedName String      // Lowercase, punctuation-stripped — used for fuzzy matching
+  slug           String      @unique
 
-  // Public-company identifiers
-  ticker         String?  @unique
-  cik            String?  @unique // SEC CIK, stored zero-padded to 10 digits
-  exchange       String? // "NYSE" | "NASDAQ" | "OTC"
+  // Identifiers
+  domain         String?     // Primary web domain — used for deduplication and logo lookup
+  ticker         String?     @unique
+  cik            String?     @unique // SEC CIK, zero-padded to 10 digits
+  exchange       String?             // "NYSE" | "NASDAQ" | "OTC"
 
-  // Business classification
+  companyType    CompanyType @default(PRIVATE)
+
+  // Descriptive
+  website        String?
+  description    String?     @db.Text
+  confidenceNotes String?    @db.Text // Human-readable notes about data quality gaps
+
+  // Classification
   industry       String?
   sector         String?
-  sicCode        String? // 4-digit SIC
+  sicCode        String?   // 4-digit SIC
   naicsCode      String?
 
-  // Headquarters
-  hqCity         String?
-  hqState        String? // 2-letter code
-  hqCountry      String?  @default("US")
+  // Location
+  headquartersCity    String?
+  headquartersState   String?   // 2-letter USPS code
+  headquartersCountry String?   @default("US")
 
   // Workforce
-  employeeCount      Int?
-  employeeCountSource String? // "SEC_10K" | "WARN" | "MANUAL"
-  employeeCountAsOf  DateTime?
+  employeeCount       Int?
+  employeeCountSource String?   // "SEC_10K" | "WARN" | "MANUAL"
+  employeeCountAsOf   DateTime?
 
-  isPublic       Boolean  @default(false)
-
-  // Risk
-  riskScore      RiskScore?
-  riskHistory    RiskScoreHistory[]
-
-  // Source data
-  warnNotices    WarnNotice[]
-  secFilings     SecFiling[]
+  // Relations
+  aliases         CompanyAlias[]
+  layoffEvents    LayoffEvent[]
+  financialReports FinancialReport[]
+  riskScore       RiskScore?
+  riskHistory     RiskScoreHistory[]
+  sourceDocuments SourceDocument[]
+  newsItems       CompanyNews[]
+  watchlistEntries Watchlist[]
 
   // Ingestion state
-  dataQuality      DataQuality @default(LOW)
-  secDataFetchedAt  DateTime?
-  warnDataFetchedAt DateTime?
-  lastScoredAt      DateTime?
+  dataQuality          DataQuality @default(LOW)
+  secDataFetchedAt     DateTime?
+  warnDataFetchedAt    DateTime?
+  lastScoredAt         DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([normalizedName])
+  @@index([ticker])
+  @@index([cik])
+  @@index([headquartersState])
+  @@index([companyType])
   @@index([sicCode])
-  @@index([hqState])
-  @@index([isPublic])
+  @@index([dataQuality])
 }
 
-// ─── WARN Act Notices ─────────────────────────────────────────────────────────
-
-// A WARN notice is a 60-day advance notice required by federal law for mass layoffs.
-// It is the most direct, verifiable public signal of employer instability.
-
-model WarnNotice {
+// Alternative names, former names, DBA names, and abbreviations.
+// Used during WARN → Company matching to avoid false negatives.
+model CompanyAlias {
   id         String  @id @default(cuid())
 
-  company    Company? @relation(fields: [companyId], references: [id])
-  companyId  String?
+  company    Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId  String
 
-  // Filed data (verbatim from state sources)
-  employerName    String
-  state           String   // 2-letter state code where notice was filed
-  city            String?
-  county          String?
-  zip             String?
+  alias      String  // Original-casing alias
+  normalized String  // Lowercase, stripped — for matching queries
 
-  noticeDate      DateTime
-  layoffDate      DateTime? // Effective date of layoff (may be future-dated)
-  affectedWorkers Int
-  isTemporary     Boolean  @default(false)
+  aliasType  AliasType @default(FORMER_NAME)
+  source     String?   // e.g. "SEC_EDGAR" | "WARN_FILING" | "MANUAL"
 
-  noticeType WarnNoticeType
+  @@unique([companyId, normalized])
+  @@index([normalized])
+  @@index([companyId])
+}
 
-  // Source provenance — required for idempotent re-ingestion
-  sourceState String
-  sourceUrl   String?
-  sourceRowId String? // State system's row ID or hash of raw record
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SOURCE PROVENANCE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  rawData Json // Original record, preserved for audit / re-parsing
+// Central provenance table. Every LayoffEvent and FinancialReport links here.
+// Raw payloads are preserved for audit and re-parsing when formats change.
+model SourceDocument {
+  id        String @id @default(cuid())
+
+  company   Company? @relation(fields: [companyId], references: [id])
+  companyId String?
+
+  documentType SourceDocumentType
+
+  // Common provenance fields
+  url         String?
+  title       String?
+  publishedAt DateTime?
+  retrievedAt DateTime  @default(now())
+
+  // SEC-specific (when documentType = SEC_*)
+  accessionNumber String?  @unique
+  formType        String?
+  filingDate      DateTime?
+  periodOfReport  DateTime?
+
+  // WARN state record-specific
+  stateCode   String?
+  sourceRowId String?   // State system's row ID or stable hash for dedup
+
+  // Raw payload — preserved for re-parsing without re-fetching
+  rawData Json?
+
+  // Relations
+  layoffEvents      LayoffEvent[]
+  financialReports  FinancialReport[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([stateCode, sourceRowId])
+  @@index([companyId])
+  @@index([documentType])
+  @@index([publishedAt])
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYOFF EVENTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// The canonical workforce reduction record.
+// Spans WARN filings, SEC disclosures, press releases, and manual entries —
+// all unified into a single model with structured classification.
+model LayoffEvent {
+  id        String @id @default(cuid())
+
+  company   Company? @relation(fields: [companyId], references: [id])
+  companyId String?
+
+  // Dates
+  announcedDate DateTime
+  effectiveDate DateTime?  // When the layoff takes effect (may be future-dated)
+
+  // Scale
+  employeesAffected Int?
+  percentAffected   Float?  // 0.0–1.0 fraction of total workforce
+
+  // Scope
+  geography String?  // e.g. "San Francisco, CA" | "Global" | "North America"
+
+  // Source
+  sourceType       LayoffSourceType
+  sourceDocument   SourceDocument?  @relation(fields: [sourceDocumentId], references: [id])
+  sourceDocumentId String?
+
+  // Classification
+  reasonClassification LayoffReason    @default(UNKNOWN)
+  confidenceLabel      ConfidenceLabel
+  rawReasonText        String?         @db.Text // Verbatim reason text from the source
+
+  // Flags
+  isTemporary Boolean @default(false)
+  notes       String? @db.Text
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([sourceState, sourceRowId])
   @@index([companyId])
-  @@index([noticeDate])
-  @@index([state])
-  @@index([employerName])
+  @@index([announcedDate])
+  @@index([effectiveDate])
+  @@index([sourceType])
+  @@index([reasonClassification])
+  @@index([confidenceLabel])
 }
 
-// ─── SEC Filings ──────────────────────────────────────────────────────────────
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FINANCIAL REPORTS + METRICS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// 10-K (annual), 10-Q (quarterly), 8-K (material events).
-// Financial metrics are extracted from XBRL inline data via EDGAR API.
-
-model SecFiling {
-  id        String  @id @default(cuid())
+// Filing-level container — qualitative flags that don't fit in metrics.
+model FinancialReport {
+  id        String @id @default(cuid())
 
   company   Company @relation(fields: [companyId], references: [id])
   companyId String
 
-  accessionNumber String   @unique
-  formType        String // "10-K" | "10-Q" | "8-K"
-  filingDate      DateTime
-  periodOfReport  DateTime?
+  sourceDocument   SourceDocument? @relation(fields: [sourceDocumentId], references: [id])
+  sourceDocumentId String?
 
-  // Extracted financial metrics (stored in cents to avoid float error)
-  revenue             BigInt?
-  revenueYoYChange    Float? // Fractional: -0.12 means -12% YoY
-  operatingCashFlow   BigInt?
-  freeCashFlow        BigInt?
-  totalDebt           BigInt?
-  cashAndEquivalents  BigInt?
-  totalAssets         BigInt?
-  totalLiabilities    BigInt?
-  reportedEmployees   Int?
+  formType      String    // "10-K" | "10-Q" | "8-K"
+  filingDate    DateTime
+  periodEndDate DateTime?
 
-  // Qualitative risk indicators (parsed from filing text)
+  // Qualitative risk flags — parsed from filing text or XBRL inline elements
   goingConcernOpinion Boolean @default(false)
   restatement         Boolean @default(false)
   auditorChanged      Boolean @default(false)
   ceoChanged          Boolean @default(false)
   cfoChanged          Boolean @default(false)
 
-  // Derived signal array stored for fast retrieval
-  signals Json? // RiskSignal[]
-
-  sourceUrl String
+  metrics FinancialMetric[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -159,127 +249,462 @@ model SecFiling {
   @@index([companyId, filingDate])
   @@index([formType])
   @@index([goingConcernOpinion])
+  @@index([periodEndDate])
 }
 
-// ─── Risk Scores ──────────────────────────────────────────────────────────────
+// Key-value financial metric rows.
+// Each row is one GAAP/XBRL concept for one period.
+// This avoids wide-table schema churn when adding new XBRL concepts.
+// metricKey examples: "revenue" | "operatingCashFlow" | "totalDebt" | "employees"
+model FinancialMetric {
+  id       String @id @default(cuid())
 
-// One current score per company. Recomputed by the worker on each scoring run.
-// Historical scores are written to RiskScoreHistory for trend charts.
+  report   FinancialReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  reportId String
 
+  metricKey   String   // Stable camelCase slug — maps to GAAP concept name
+  metricValue Decimal? // Primary numeric value (in base units — dollars not cents)
+  textValue   String?  // For non-numeric metrics
+  unit        String?  // "USD" | "shares" | "employees" | "ratio" | "%"
+
+  // Period and trend
+  periodEnd  DateTime?
+  priorValue Decimal?  // Same metric from prior comparable period
+  yoyChange  Float?    // (metricValue - priorValue) / abs(priorValue)
+
+  confidenceLabel ConfidenceLabel @default(REPORTED)
+
+  @@unique([reportId, metricKey])
+  @@index([reportId])
+  @@index([metricKey])
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RISK SCORING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Current risk score — one per company. Upserted on every scoring run.
+// RiskBand (LOW/MEDIUM/HIGH) is the coarse DB-level classification.
+// The 5-tier display (STABLE→CRITICAL) is derived in the application layer
+// from the numeric score so display granularity doesn't require migrations.
 model RiskScore {
   id        String  @id @default(cuid())
 
   company   Company @relation(fields: [companyId], references: [id])
   companyId String  @unique
 
-  // Composite score: 0 (minimal risk) → 100 (severe risk)
-  score Float
-  tier  RiskTier
+  // Overall assessment
+  score Float    // 0–100; higher = more risk
+  band  RiskBand // LOW 0–33 | MEDIUM 34–66 | HIGH 67–100
 
-  // Component sub-scores (each 0–100), surfaced for transparency
-  warnScore      Float?
-  secScore       Float?
-  financialScore Float?
-  momentumScore  Float?
+  // Granular component scores (each 0–100)
+  // Kept separate so the UI can explain which dimension drove the score
+  layoffRecencyScore    Float  // How recent is the latest layoff event?
+  layoffFrequencyScore  Float  // How many events in trailing 24 months?
+  layoffSeverityScore   Float  // Employees affected as % of reported headcount
+  financialWeaknessScore Float // Cash runway, revenue decline, debt burden
+  negativeSignalsScore  Float  // Going concern, restatement, exec turnover
+  recoverySignalsScore  Float  // Negative contribution — positive signals reduce score
 
-  // Explainability payload — rendered in the UI as signal cards
-  signals    Json  // RiskSignal[]
-  confidence Float // 0–1, based on data coverage and recency
+  // Data coverage
+  confidence Float  // 0–1: fraction of signal categories with verified data
 
-  dataAsOf   DateTime // Freshness of underlying source data
   computedAt DateTime @default(now())
+  dataAsOf   DateTime // Latest data point date used in this computation
   updatedAt  DateTime @updatedAt
+
+  explanations RiskScoreExplanation[]
 }
 
+// Per-signal explanation rows. Each row = one risk signal.
+// Stored separately from RiskScore so signals can be queried, sorted, and
+// rendered individually without deserializing a JSON blob.
+model RiskScoreExplanation {
+  id          String    @id @default(cuid())
+
+  riskScore   RiskScore @relation(fields: [riskScoreId], references: [id], onDelete: Cascade)
+  riskScoreId String
+
+  signalId    String          // Stable slug — e.g. "warn_recent_12m"
+  category    SignalCategory
+  severity    SignalSeverity
+
+  title       String
+  description String          @db.Text
+
+  numericValue Float?
+  textValue    String?
+
+  weight       Float   // 0–1 within this signal's category
+  contribution Float   // Actual points this signal added to the composite score
+
+  @@index([riskScoreId])
+  @@index([category])
+  @@index([severity])
+}
+
+// Append-only history for trend charts. Written alongside every RiskScore upsert.
 model RiskScoreHistory {
   id        String @id @default(cuid())
 
   company   Company @relation(fields: [companyId], references: [id])
   companyId String
 
-  score      Float
-  tier       RiskTier
-  signals    Json
-  confidence Float
+  score     Float
+  band      RiskBand
 
+  layoffRecencyScore     Float
+  layoffFrequencyScore   Float
+  layoffSeverityScore    Float
+  financialWeaknessScore Float
+  negativeSignalsScore   Float
+  recoverySignalsScore   Float
+
+  confidence Float
   computedAt DateTime @default(now())
 
   @@index([companyId, computedAt])
 }
 
-// ─── Users ────────────────────────────────────────────────────────────────────
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// COMPANY NEWS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+model CompanyNews {
+  id        String  @id @default(cuid())
+
+  company   Company @relation(fields: [companyId], references: [id])
+  companyId String
+
+  headline    String
+  summary     String?     @db.Text
+  url         String      @unique
+  publishedAt DateTime
+  source      String      // e.g. "Reuters" | "Bloomberg" | "company blog"
+
+  sentiment       NewsSentiment?
+  isLayoffRelated Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, publishedAt])
+  @@index([isLayoffRelated])
+  @@index([publishedAt])
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// USERS + ENTITLEMENTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 model User {
-  id            String    @id @default(cuid())
-  email         String    @unique
-  emailVerified DateTime?
-  name          String?
-  avatarUrl     String?
+  id             String    @id @default(cuid())
+  email          String    @unique
+  emailVerified  DateTime?
+  name           String?
+  avatarUrl      String?
 
-  plan                 Plan    @default(FREE)
   stripeCustomerId     String? @unique
   stripeSubscriptionId String? @unique
-  planExpiresAt        DateTime?
 
-  watchlist CompanyWatch[]
+  plan          UserPlan?
+  usage         UsageCounter[]
+  watchlist     Watchlist[]
+  alerts        Alert[]
+  reports       PremiumReport[]
+  billingEvents BillingPlaceholderEvent[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
-model CompanyWatch {
+// Explicit entitlement table.
+// Using explicit columns (not deriving from plan name) means we can:
+//  - Grant individual capability upgrades without a plan change
+//  - Support custom enterprise plans without code changes
+//  - Show "why can't I do X?" answers directly from DB values
+model UserPlan {
+  id     String @id @default(cuid())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String @unique
+
+  plan Plan @default(FREE)
+
+  // Capability entitlements — explicit for auditability and custom plans
+  monthlyCompanyViewLimit Int     @default(5)    // -1 = unlimited
+  compareLimit            Int     @default(0)    // Number of companies per comparison
+  alertsEnabled           Boolean @default(false)
+  premiumReportsEnabled   Boolean @default(false)
+  watchlistSizeLimit      Int     @default(3)    // -1 = unlimited
+  apiAccessEnabled        Boolean @default(false)
+
+  // Billing period
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+  trialEndsAt        DateTime?
+
+  updatedAt DateTime @updatedAt
+}
+
+// Per-user, per-month usage counters.
+// Incremented in the same transaction as the action being counted.
+// The UNIQUE constraint on (userId, year, month) makes upserts safe.
+model UsageCounter {
+  id     String @id @default(cuid())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  year  Int
+  month Int  // 1–12
+
+  companyViews      Int @default(0)
+  compareRequests   Int @default(0)
+  reportGenerations Int @default(0)
+  alertsSent        Int @default(0)
+
+  @@unique([userId, year, month])
+  @@index([userId, year, month])
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// WATCHLISTS + ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+model Watchlist {
   id        String @id @default(cuid())
 
-  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId    String
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
   companyId String
 
-  alertsEnabled       Boolean @default(true)
-  notifyOnTierChange  Boolean @default(true)
-  notifyOnNewWarn     Boolean @default(true)
+  // Per-item alert preferences
+  alertOnBandChange  Boolean @default(true)
+  alertOnNewLayoff   Boolean @default(true)
+  alertOnScoreSpike  Boolean @default(false)
+  scoreAlertThreshold Float?  // Alert if score exceeds this value
 
   createdAt DateTime @default(now())
 
   @@unique([userId, companyId])
   @@index([companyId])
+  @@index([userId])
 }
 
-model AlertLog {
-  id         String   @id @default(cuid())
-  userId     String
-  companyId  String
-  alertType  String // "TIER_CHANGE" | "NEW_WARN" | "SCORE_SPIKE"
-  payload    Json?
-  sentAt     DateTime @default(now())
+model Alert {
+  id        String @id @default(cuid())
+
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+
+  companyId String
+
+  alertType AlertType
+
+  // Score delta captured at alert generation time
+  priorBand  RiskBand?
+  newBand    RiskBand?
+  priorScore Float?
+  newScore   Float?
+
+  // Delivery tracking
+  deliveredAt DateTime?
+  readAt      DateTime?
+  channel     String?   // "email" | "in_app" | "webhook"
+
+  payload Json?   // Additional context for rendering the alert
+
+  createdAt DateTime @default(now())
 
   @@index([userId, companyId])
-  @@index([sentAt])
+  @@index([createdAt])
+  @@index([deliveredAt])
+  @@index([alertType])
 }
 
-// ─── Enums ────────────────────────────────────────────────────────────────────
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PREMIUM REPORTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-enum RiskTier {
-  STABLE
-  WATCH
-  ELEVATED
+model PremiumReport {
+  id        String @id @default(cuid())
+
+  user      User   @relation(fields: [userId], references: [id])
+  userId    String
+
+  companyId String
+  reportType ReportType
+  status     ReportStatus @default(PENDING)
+
+  // Storage — agnostic to provider (S3, R2, etc.)
+  storageKey  String?   // Object storage key
+  downloadUrl String?   // Pre-signed or CDN URL
+  expiresAt   DateTime? // When the download URL expires
+
+  // Inputs snapshot — hash of inputs so we can detect staleness
+  inputsHash  String?
+
+  generatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([companyId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BILLING EVENTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Lightweight passthrough log for Stripe webhook events.
+// The "Placeholder" name signals this is a minimal implementation —
+// a production billing system would have richer models.
+// Stored here so we can reconcile plan state without querying Stripe.
+model BillingPlaceholderEvent {
+  id     String @id @default(cuid())
+
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  eventType     String   // Stripe event type e.g. "checkout.session.completed"
+  stripeEventId String?  @unique
+
+  // Financial summary
+  amount   Int?    // In cents
+  currency String? @default("usd")
+
+  // Processing state
+  processedAt DateTime?
+  failed      Boolean   @default(false)
+  failReason  String?
+
+  payload Json?   // Raw Stripe event object
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([eventType])
+  @@index([processedAt])
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ENUMS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+enum CompanyType {
+  PUBLIC
+  PRIVATE
+}
+
+enum AliasType {
+  FORMER_NAME
+  DBA
+  ABBREVIATION
+  TICKER
+  TRADE_NAME
+}
+
+enum DataQuality {
+  LOW    // Name-only match; no verified external identifiers
+  MEDIUM // Partial coverage — WARN only, or SEC only
+  HIGH   // Verified CIK/ticker, matched WARN records, recent data
+}
+
+enum LayoffSourceType {
+  WARN         // U.S. WARN Act state filing
+  SEC_FILING   // Disclosed in 10-K, 10-Q, or 8-K
+  NEWSROOM     // Official company blog or press room
+  PRESS        // Third-party news outlet
+  MANUAL       // Human-entered record
+}
+
+enum LayoffReason {
+  COST_CUTTING
+  RESTRUCTURING
+  DEMAND_SLOWDOWN
+  POST_MERGER_INTEGRATION
+  PRODUCT_SHIFT
+  AI_SHIFT
+  FACILITY_CLOSURE
+  PROFITABILITY_PUSH
+  FUNDING_PRESSURE
+  UNKNOWN
+}
+
+enum ConfidenceLabel {
+  REPORTED   // Directly stated in a primary source
+  DERIVED    // Calculated from primary data via documented formula
+  ESTIMATED  // Approximated from partial data; margin of uncertainty applies
+  INFERRED   // Reasoned from indirect signals; lowest confidence
+  UNKNOWN    // Source could not be determined
+}
+
+enum SourceDocumentType {
+  WARN_NOTICE
+  SEC_10K
+  SEC_10Q
+  SEC_8K
+  NEWS_ARTICLE
+  PRESS_RELEASE
+  MANUAL_ENTRY
+}
+
+enum RiskBand {
+  LOW     // Score 0–33
+  MEDIUM  // Score 34–66
+  HIGH    // Score 67–100
+}
+
+enum SignalCategory {
+  WARN
+  SEC
+  FINANCIAL
+  MOMENTUM
+}
+
+enum SignalSeverity {
+  INFO
+  LOW
+  MEDIUM
   HIGH
   CRITICAL
 }
 
-enum WarnNoticeType {
-  LAYOFF
-  PLANT_CLOSING
-  RELOCATION
-}
-
-enum DataQuality {
-  LOW    // Name match only — no verified identifiers
-  MEDIUM // Partial coverage (WARN only, or SEC only)
-  HIGH   // Full coverage with verified CIK/ticker and WARN match
+enum NewsSentiment {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
 }
 
 enum Plan {
   FREE
   PRO
   ENTERPRISE
+}
+
+enum AlertType {
+  BAND_CHANGE      // Risk band changed (e.g. LOW → HIGH)
+  SCORE_SPIKE      // Score increased by > threshold in one period
+  NEW_LAYOFF       // New LayoffEvent created for watched company
+  GOING_CONCERN    // Going concern opinion filed
+  WATCHLIST_DIGEST // Periodic summary digest
+}
+
+enum ReportType {
+  COMPANY_PROFILE   // Full company risk report
+  RISK_DEEP_DIVE    // Signal-by-signal analysis
+  COMPARISON        // Side-by-side company comparison
+}
+
+enum ReportStatus {
+  PENDING
+  GENERATING
+  READY
+  FAILED
+  EXPIRED
 }

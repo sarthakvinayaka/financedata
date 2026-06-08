@@ -1,15 +1,8 @@
 // Score recomputation job
 //
-// Runs the risk engine for every company that has been scored or has new data.
-// The engine is deterministic and pure — this job handles all I/O:
-//  1. Fetch company + relations from DB
-//  2. Shape data into RiskEngineInput
-//  3. Run computeRiskScore (pure)
-//  4. Write RiskScore (upsert) and RiskScoreHistory (append)
-//
-// Processes all companies in batches. Companies with no WARN notices and no
-// public filings are scored with a low-confidence STABLE result rather than
-// being skipped — the absence of data is itself informative.
+// Fetches every company with layoff events or financial reports, runs the
+// risk engine, and upserts RiskScore + appends RiskScoreHistory.
+// Also writes per-signal RiskScoreExplanation rows for the detail view.
 //
 // Run: pnpm score:recompute
 
@@ -22,10 +15,8 @@ const BATCH_SIZE = 100
 export async function runScoreRecompute(): Promise<void> {
   const log = logger.child({ job: 'score:recompute' })
 
-  log.info('Starting score recomputation')
-
   const total = await prisma.company.count()
-  log.info({ total }, 'Companies to score')
+  log.info({ total }, 'Starting score recomputation')
 
   let cursor: string | undefined
   let scored = 0
@@ -37,37 +28,43 @@ export async function runScoreRecompute(): Promise<void> {
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
       select: {
         id: true,
-        isPublic: true,
+        companyType: true,
         employeeCount: true,
         riskScore: { select: { score: true } },
-        warnNotices: {
+        layoffEvents: {
           select: {
-            noticeDate: true,
-            layoffDate: true,
-            affectedWorkers: true,
-            noticeType: true,
+            announcedDate: true,
+            effectiveDate: true,
+            employeesAffected: true,
+            percentAffected: true,
+            sourceType: true,
+            reasonClassification: true,
+            confidenceLabel: true,
             isTemporary: true,
           },
+          orderBy: { announcedDate: 'desc' },
         },
-        secFilings: {
+        financialReports: {
+          where: { formType: { in: ['10-K', '10-Q', '8-K'] } },
+          orderBy: { filingDate: 'desc' },
+          take: 8,
           select: {
             formType: true,
             filingDate: true,
-            periodOfReport: true,
+            periodEndDate: true,
             goingConcernOpinion: true,
             restatement: true,
             auditorChanged: true,
             ceoChanged: true,
             cfoChanged: true,
-            revenueYoYChange: true,
-            revenue: true,
-            operatingCashFlow: true,
-            cashAndEquivalents: true,
-            totalDebt: true,
-            reportedEmployees: true,
+            metrics: {
+              select: {
+                metricKey: true,
+                metricValue: true,
+                yoyChange: true,
+              },
+            },
           },
-          orderBy: { filingDate: 'desc' },
-          take: 10,
         },
       },
     })
@@ -77,54 +74,84 @@ export async function runScoreRecompute(): Promise<void> {
 
     for (const company of companies) {
       try {
-        const input = buildEngineInput(company as Parameters<typeof buildEngineInput>[0])
+        const input = buildEngineInput(company)
         const output = computeRiskScore(input)
 
-        await prisma.$transaction([
-          prisma.riskScore.upsert({
+        await prisma.$transaction(async (tx) => {
+          // Upsert current score
+          const score = await tx.riskScore.upsert({
             where: { companyId: company.id },
             update: {
               score: output.score,
-              tier: output.tier,
-              warnScore: output.components.warn.score,
-              secScore: output.components.sec.score,
-              financialScore: output.components.financial.score,
-              momentumScore: output.components.momentum.score,
-              signals: output.signals as never,
+              band:  output.band,
+              layoffRecencyScore:    output.components.layoffRecency,
+              layoffFrequencyScore:  output.components.layoffFrequency,
+              layoffSeverityScore:   output.components.layoffSeverity,
+              financialWeaknessScore: output.components.financialWeakness,
+              negativeSignalsScore:  output.components.negativeSignals,
+              recoverySignalsScore:  output.components.recoverySignals,
               confidence: output.confidence,
-              dataAsOf: output.dataAsOf,
+              dataAsOf:   output.dataAsOf,
             },
             create: {
               companyId: company.id,
               score: output.score,
-              tier: output.tier,
-              warnScore: output.components.warn.score,
-              secScore: output.components.sec.score,
-              financialScore: output.components.financial.score,
-              momentumScore: output.components.momentum.score,
-              signals: output.signals as never,
+              band:  output.band,
+              layoffRecencyScore:    output.components.layoffRecency,
+              layoffFrequencyScore:  output.components.layoffFrequency,
+              layoffSeverityScore:   output.components.layoffSeverity,
+              financialWeaknessScore: output.components.financialWeakness,
+              negativeSignalsScore:  output.components.negativeSignals,
+              recoverySignalsScore:  output.components.recoverySignals,
               confidence: output.confidence,
-              dataAsOf: output.dataAsOf,
+              dataAsOf:   output.dataAsOf,
             },
-          }),
-          prisma.riskScoreHistory.create({
+          })
+
+          // Replace explanation rows (delete + create = clean state)
+          await tx.riskScoreExplanation.deleteMany({ where: { riskScoreId: score.id } })
+          if (output.signals.length > 0) {
+            await tx.riskScoreExplanation.createMany({
+              data: output.signals.map((s) => ({
+                riskScoreId:  score.id,
+                signalId:     s.id,
+                category:     s.category,
+                severity:     s.severity,
+                title:        s.title,
+                description:  s.description,
+                numericValue: s.numericValue ?? null,
+                textValue:    s.textValue ?? null,
+                weight:       s.weight,
+                contribution: s.contribution,
+              })),
+            })
+          }
+
+          // Append history
+          await tx.riskScoreHistory.create({
             data: {
               companyId: company.id,
               score: output.score,
-              tier: output.tier,
-              signals: output.signals as never,
+              band:  output.band,
+              layoffRecencyScore:    output.components.layoffRecency,
+              layoffFrequencyScore:  output.components.layoffFrequency,
+              layoffSeverityScore:   output.components.layoffSeverity,
+              financialWeaknessScore: output.components.financialWeakness,
+              negativeSignalsScore:  output.components.negativeSignals,
+              recoverySignalsScore:  output.components.recoverySignals,
               confidence: output.confidence,
             },
-          }),
-          prisma.company.update({
+          })
+
+          await tx.company.update({
             where: { id: company.id },
-            data: { lastScoredAt: new Date() },
-          }),
-        ])
+            data:  { lastScoredAt: new Date() },
+          })
+        })
 
         scored++
       } catch (err) {
-        log.error({ companyId: company.id, err }, 'Scoring failed for company')
+        log.error({ companyId: company.id, err }, 'Scoring failed')
         errors++
       }
     }
