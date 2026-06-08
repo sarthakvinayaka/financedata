@@ -10,7 +10,9 @@
   },
   "scripts": {
     "lint": "tsc --noEmit",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@joinsafe/core": "workspace:*",
@@ -18,6 +20,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
   }
 }

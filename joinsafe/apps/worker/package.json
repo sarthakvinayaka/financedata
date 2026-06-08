@@ -9,6 +9,7 @@
     "ingest:sec": "tsx src/jobs/ingest-sec.ts",
     "ingest:warn": "tsx src/jobs/ingest-warn.ts",
     "score:recompute": "tsx src/jobs/score-recompute.ts",
+    "ingest:company": "tsx src/commands/ingest-company.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

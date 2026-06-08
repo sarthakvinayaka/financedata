@@ -16,7 +16,8 @@
     "db:generate": "pnpm --filter @joinsafe/db exec prisma generate",
     "ingest:sec": "pnpm --filter @joinsafe/worker ingest:sec",
     "ingest:warn": "pnpm --filter @joinsafe/worker ingest:warn",
-    "score:recompute": "pnpm --filter @joinsafe/worker score:recompute"
+    "score:recompute": "pnpm --filter @joinsafe/worker score:recompute",
+    "ingest:company": "pnpm --filter @joinsafe/worker ingest:company"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
