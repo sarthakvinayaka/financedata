@@ -9,6 +9,8 @@ import { useRouter } from 'next/navigation'
 import { RiskBadge } from '@joinsafe/ui'
 import type { RiskTier } from '@joinsafe/core'
 
+type SearchBarSize = 'md' | 'lg'
+
 interface SearchResult {
   id: string
   name: string
@@ -20,7 +22,7 @@ interface SearchResult {
   riskScore: { score: number; tier: string } | null
 }
 
-export function CompanySearchBar() {
+export function CompanySearchBar({ size = 'md' }: { size?: SearchBarSize }) {
   const router = useRouter()
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
@@ -99,17 +101,20 @@ export function CompanySearchBar() {
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
+  const isLg = size === 'lg'
+
   return (
-    <div className="relative mx-auto w-full max-w-lg">
+    <div className="relative w-full">
       <div className="relative">
-        <div className="pointer-events-none absolute inset-y-0 left-4 flex items-center">
+        {/* Search icon / spinner */}
+        <div className={`pointer-events-none absolute inset-y-0 left-0 flex items-center ${isLg ? 'pl-4' : 'pl-3.5'}`}>
           {loading ? (
-            <svg className="h-4 w-4 animate-spin text-gray-400" fill="none" viewBox="0 0 24 24">
+            <svg className={`animate-spin text-warm-400 ${isLg ? 'h-5 w-5' : 'h-4 w-4'}`} fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
           ) : (
-            <svg className="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg className={`text-warm-400 ${isLg ? 'h-5 w-5' : 'h-4 w-4'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
           )}
@@ -122,8 +127,8 @@ export function CompanySearchBar() {
           onChange={handleChange}
           onKeyDown={handleKeyDown}
           onFocus={() => results.length > 0 && setOpen(true)}
-          placeholder="Search a company — e.g. &ldquo;Acme Corp&rdquo; or ticker &ldquo;ACME&rdquo;"
-          className="w-full rounded-xl border border-gray-300 bg-white py-3.5 pl-11 pr-4 text-sm text-gray-900 shadow-sm placeholder:text-gray-400 focus:border-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-200"
+          placeholder={isLg ? 'Search by company name or ticker — e.g. "Meridian Software"' : 'Search a company or ticker'}
+          className={`input w-full ${isLg ? 'input-lg pl-12' : 'pl-10'} shadow-surface`}
           aria-label="Search companies"
           aria-autocomplete="list"
           aria-controls="search-results"
@@ -137,7 +142,7 @@ export function CompanySearchBar() {
           id="search-results"
           ref={dropdownRef}
           role="listbox"
-          className="absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-lg"
+          className="absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden rounded-lg border border-subtle bg-surface shadow-overlay animate-slide-up"
         >
           {results.map((result, i) => (
             <button
@@ -145,20 +150,20 @@ export function CompanySearchBar() {
               role="option"
               aria-selected={i === activeIndex}
               onClick={() => handleSelect(result)}
-              className={`flex w-full items-center justify-between px-4 py-3 text-left transition-colors ${
-                i === activeIndex ? 'bg-gray-50' : 'hover:bg-gray-50'
+              className={`flex w-full items-center justify-between px-4 py-3 text-left transition-colors border-b border-subtle last:border-0 ${
+                i === activeIndex ? 'bg-subtle' : 'hover:bg-subtle'
               }`}
             >
               <div className="min-w-0">
-                <p className="truncate text-sm font-medium text-gray-900">{result.name}</p>
-                <p className="mt-0.5 text-xs text-gray-400">
+                <p className="truncate text-sm font-medium text-primary">{result.name}</p>
+                <p className="mt-0.5 type-caption text-faint">
                   {[result.ticker, result.hqState, result.industry].filter(Boolean).join(' · ')}
                 </p>
               </div>
 
               {result.riskScore && (
                 <div className="ml-3 shrink-0 flex items-center gap-2">
-                  <span className="font-mono text-sm font-bold text-gray-600">
+                  <span className="font-mono text-sm font-semibold text-secondary tabular-nums">
                     {Math.round(result.riskScore.score)}
                   </span>
                   <RiskBadge tier={result.riskScore.tier as RiskTier} size="sm" />
