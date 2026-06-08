@@ -1,0 +1,45 @@
+version: "3.9"
+
+# Local development infrastructure.
+# Run: docker compose up -d
+# This starts a Postgres instance pre-configured for JoinSafe.
+# All data is persisted in the postgres_data volume.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: joinsafe_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: joinsafe
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d joinsafe"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Optional: pgAdmin for database inspection
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: joinsafe_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@joinsafe.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+    driver: local
